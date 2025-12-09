@@ -1,4 +1,5 @@
 import { Hono, Context } from 'hono'
+import { serve } from '@hono/node-server'
 import { stream } from 'hono/streaming'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -434,9 +435,16 @@ const messagesFn = async (c: Context) => {
 app.post('/v1/chat/completions', messagesFn)
 app.post('/v1/messages', messagesFn)
 
-const port = process.env.PORT || 9095
+const port = Number(process.env.PORT) || 9095
+
+// Start local server when not running on Vercel
+if (!process.env.VERCEL) {
+  console.log(`🚀 Listening locally on http://localhost:${port}`)
+  serve({
+    fetch: app.fetch,
+    port,
+  })
+}
 
 // Export app for Vercel
 export default app
-
-// Server is started differently for local development vs Vercel
