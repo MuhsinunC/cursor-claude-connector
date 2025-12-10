@@ -78,41 +78,43 @@ This will:
 For detailed instructions or alternative deployment methods, see our **[Deployment Guide](DEPLOYMENT.md)**.
 
 ### Local Development
+NOTE: For local deployment, we need ngrok because Cursor's cloud agent cannot reach your localhost; it requires a publicly reachable HTTPS endpoint. We use ngrok to expose the local proxy so Cursor can talk to it. If you skip ngrok, Cursor cloud calls to your local server will fail; only purely local clients (like curl) would work.
 
-1. **Clone the repository**
+1) **Clone the repository**
+```bash
+git clone https://github.com/Maol-1997/cursor-claude-connector.git
+cd cursor-claude-connector
+```
 
-   ```bash
-   git clone https://github.com/Maol-1997/cursor-claude-connector.git
-   cd cursor-claude-connector
-   ```
+2) **Configure `.env`**
+```bash
+cp env.example .env
+```
+Fill at least:
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+- `API_KEY` (optional; this is the key you will give to Cursor. Make it up.)
+- `NGROK_DOMAIN` (your reserved ngrok domain, e.g. sensitive-cheryle-unwillfully.ngrok-free.dev)
 
-2. **Set up Upstash Redis**
+Optional toggles:
+- `FORCE_THINKING_BUDGET` (forces thinking if missing; budget is auto-shrunk to fit 64k cap)
+- `FORCE_MAX_TOKENS` (forces outgoing max_tokens to this number, capped at 64k)
+- `LOG_REQUEST_DEBUG` (writes incoming/outgoing bodies to `logs/requests.log`)
 
-   - Create a free Redis database at [Upstash Console](https://console.upstash.com/)
-   - Copy your REST URL and REST Token
-   - Copy `env.example` to `.env` and update with your values:
+3) **Run the start script** (starts proxy + ngrok, cleans up on exit)
+```bash
+./start.sh
+```
+If ngrok isn't configured, the script will warn and only start the proxy locally.
 
-   ```bash
-   cp env.example .env
-   # Edit .env with your Upstash credentials
-   ```
+4) **Authenticate with Claude**
+Open `http://localhost:9095/` and complete the OAuth flow (saves tokens to Upstash).
 
-3. **Run the start script**
-
-   ```bash
-   ./start.sh
-   ```
-
-4. **Authenticate with Claude**
-
-   - Open `http://localhost:9095/` in your browser
-   - Follow the authentication process
-
-5. **Configure Cursor**
-   - Go to Settings → Models
-   - Enable "Override OpenAI Base URL"
-   - Enter: `http://localhost:9095/v1` (for local) or `https://your-app.vercel.app/v1` (for Vercel)
-   - If you set an API_KEY during deployment, add it to your API key field in Cursor
+5) **Configure Cursor**
+- Settings → Models → Override OpenAI Base URL:
+  - If using ngrok: `https://<NGROK_DOMAIN>/v1`
+  - If you skipped ngrok: `http://localhost:9095/v1`
+- API key: use `API_KEY` from `.env` if you set one (otherwise leave blank).
 
 ## 🎉 Advantages of this solution
 
