@@ -4,6 +4,7 @@ import { stream } from 'hono/streaming'
 import { readFile, appendFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { createHash } from 'node:crypto'
+import { Redis } from '@upstash/redis'
 import { getAccessToken } from './auth/oauth-manager'
 import {
   login as oauthLogin,
@@ -34,6 +35,16 @@ import type {
 
 const app = new Hono()
 
+// Initialize Redis client for thinking block cache
+// This persists across server restarts, unlike in-memory cache
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL || '',
+  token: process.env.UPSTASH_REDIS_REST_TOKEN || '',
+})
+
+// Redis key prefix for thinking block cache
+const THINKING_CACHE_PREFIX = 'thinking:'
+
 // Cache for thinking blocks - maps context hash to thinking block
 // This allows us to restore thinking blocks that Cursor strips from conversation history
 // The hash includes all messages UP TO AND INCLUDING the assistant message, ensuring
@@ -42,7 +53,6 @@ interface ThinkingBlockCache {
   thinking: string
   signature: string
 }
-const thinkingBlockCache = new Map<string, ThinkingBlockCache>()
 
 // Extract text content from a message for hashing (ignoring thinking blocks)
 function extractMessageText(content: any): string {
@@ -80,7 +90,7 @@ function hashConversationContext(messages: any[], assistantIndex: number): strin
 // Called after receiving a response - we hash all messages that were sent plus the new response
 let lastRequestMessages: any[] = []
 
-function cacheThinkingBlock(content: any[], requestMessages: any[]): void {
+async function cacheThinkingBlock(content: any[], requestMessages: any[]): Promise<void> {
   const thinkingBlock = content.find((b: any) => b.type === 'thinking' && b.signature)
   if (!thinkingBlock) return
 
@@ -97,15 +107,25 @@ function cacheThinkingBlock(content: any[], requestMessages: any[]): void {
   
   const hash = createHash('sha256').update(contextParts.join('\n---\n')).digest('hex').slice(0, 32)
   
-  thinkingBlockCache.set(hash, {
-    thinking: thinkingBlock.thinking || '',
-    signature: thinkingBlock.signature,
-  })
+  try {
+    // Store in Redis - eviction handled by Redis eviction policy (configure in Upstash console)
+    await redis.set(`${THINKING_CACHE_PREFIX}${hash}`, {
+      thinking: thinkingBlock.thinking || '',
+      signature: thinkingBlock.signature,
+    })
+  } catch (err) {
+    console.warn('[proxy] WARNING: Failed to cache thinking block to Redis:', err)
+  }
+}
 
-  // Limit cache size (LRU-ish: just cap at 1000 entries)
-  if (thinkingBlockCache.size > 1000) {
-    const firstKey = thinkingBlockCache.keys().next().value
-    if (firstKey) thinkingBlockCache.delete(firstKey)
+// Get cached thinking block from Redis
+async function getCachedThinkingBlock(hash: string): Promise<ThinkingBlockCache | null> {
+  try {
+    const cached = await redis.get<ThinkingBlockCache>(`${THINKING_CACHE_PREFIX}${hash}`)
+    return cached
+  } catch (err) {
+    console.warn('[proxy] WARNING: Failed to get thinking block from Redis:', err)
+    return null
   }
 }
 
@@ -504,6 +524,17 @@ const messagesFn = async (c: Context) => {
       !body.thinking &&
       supportsExtendedThinking(body.model)
 
+    // Log if thinking is not being forced (for debugging)
+    if (!shouldForceThinking) {
+      if (body.thinking) {
+        console.log(`[proxy] -----> THINKING: ALREADY SET BY CALLER`)
+      } else if (!supportsExtendedThinking(body.model)) {
+        console.log(`[proxy] -----> THINKING: NOT SUPPORTED (model: ${body.model})`)
+      } else if (!Number.isFinite(forceThinkingBudget) || forceThinkingBudget <= 0) {
+        console.log(`[proxy] -----> THINKING: NOT FORCED (FORCE_THINKING_BUDGET not set)`)
+      }
+    }
+
     if (shouldForceThinking && Array.isArray(body.messages)) {
       // Try to inject cached thinking blocks into assistant messages
       // We use full conversation context for cache lookup to ensure accuracy
@@ -529,9 +560,9 @@ const messagesFn = async (c: Context) => {
           continue // Already has thinking
         }
 
-        // Try to find cached thinking block using full conversation context
+        // Try to find cached thinking block using full conversation context (from Redis)
         const hash = hashConversationContext(body.messages, i)
-        const cached = thinkingBlockCache.get(hash)
+        const cached = await getCachedThinkingBlock(hash)
 
         if (cached) {
           // Inject the cached thinking block at the start
@@ -551,59 +582,118 @@ const messagesFn = async (c: Context) => {
           model: body.model,
           injectedCount,
           missingCount,
-          cacheSize: thinkingBlockCache.size,
         })
       }
 
-      // Only enable thinking if we successfully injected all needed blocks (or there were none needed)
-      if (missingCount === 0) {
-        const newThinking: any = {
-          type: 'enabled',
-          budget_tokens: forceThinkingBudget,
-        }
-        body.thinking = newThinking
+      // Determine if we're inside a tool loop by checking if the last user message is a tool_result
+      // Per Anthropic docs: thinking blocks are ONLY mandatory when returning tool_results
+      // When the last user message is TEXT (not tool_result), the API strips old thinking blocks
+      const lastUserMsg = [...body.messages].reverse().find((m: any) => m.role === 'user')
+      const isInsideToolLoop = lastUserMsg && Array.isArray(lastUserMsg.content) &&
+        lastUserMsg.content.some((block: any) => block.type === 'tool_result')
 
-        const incomingMax =
-          typeof body.max_tokens === 'number' ? body.max_tokens : null
+      // Decision logic:
+      // - If we have all cached blocks (missingCount === 0): enable thinking
+      // - If missing blocks BUT outside tool loop (last msg is text): enable thinking (API strips old blocks)
+      // - If missing blocks AND inside tool loop: temporarily disable thinking to complete the loop
+      const canEnableThinking = missingCount === 0 || !isInsideToolLoop
+
+      if (canEnableThinking) {
+        // Claude API: max_tokens is the TOTAL output (thinking + response combined)
+        // budget_tokens is the max thinking tokens, which must be:
+        // 1. >= 1024 (Claude minimum)
+        // 2. < max_tokens (thinking must leave room for response)
+        
         const modelCap = getModelMaxTokens(body.model)
-
+        const incomingMax = typeof body.max_tokens === 'number' ? body.max_tokens : null
+        
+        let effectiveMaxTokens: number
         let usedFallbackMax = false
-        let effectiveMaxTokens = incomingMax
-
+        
         if (incomingMax !== null) {
-          // Respect caller max_tokens; adjust thinking budget to fit within cap
-          const maxThinkingPossible = Math.max(0, modelCap - incomingMax)
-          if (newThinking.budget_tokens > maxThinkingPossible) {
-            newThinking.budget_tokens = maxThinkingPossible
-          }
+          // Caller provided max_tokens - use it (capped at model limit)
+          effectiveMaxTokens = Math.min(incomingMax, modelCap)
         } else {
-          // No caller max_tokens: choose a fallback and cap to model limit
-          const fallback = Math.max(forceThinkingBudget + 6000, forceThinkingBudget * 2)
+          // No max_tokens provided - use a sensible default
+          // We want room for both thinking and response
+          const fallback = Math.min(forceThinkingBudget * 2, modelCap)
+          effectiveMaxTokens = fallback
           usedFallbackMax = true
-          const cappedFallback = Math.min(fallback, modelCap)
-          effectiveMaxTokens = cappedFallback
-          newThinking.budget_tokens = Math.min(newThinking.budget_tokens, cappedFallback)
-          body.max_tokens = cappedFallback
         }
+        
+        // budget_tokens must be strictly less than max_tokens
+        const maxBudgetAllowed = effectiveMaxTokens - 1
+        let budgetTokens = Math.min(forceThinkingBudget, maxBudgetAllowed)
+        
+        // Check if we can fit minimum thinking budget (1024)
+        if (budgetTokens < 1024) {
+          // Can't enable thinking - max_tokens is too low
+          console.log(
+            `[proxy] -----> THINKING: DISABLED (max_tokens=${effectiveMaxTokens} too low for minimum budget 1024)`
+          )
+          await logRequest('thinking-disabled-max-tokens-too-low', {
+            model: body.model,
+            maxTokens: effectiveMaxTokens,
+            minimumBudgetRequired: 1024,
+            reason: 'max_tokens too low to fit minimum thinking budget',
+          })
+        } else {
+          // Enable thinking!
+          body.thinking = {
+            type: 'enabled',
+            budget_tokens: budgetTokens,
+          }
+          
+          // Set max_tokens if we calculated a fallback
+          if (usedFallbackMax) {
+            body.max_tokens = effectiveMaxTokens
+          }
+          
+          // When thinking is enabled, temperature MUST be 1 (Claude API requirement)
+          if (body.temperature !== undefined && body.temperature !== 1) {
+            await logRequest('temperature-forced-for-thinking', {
+              model: body.model,
+              originalTemperature: body.temperature,
+              forcedTemperature: 1,
+            })
+          }
+          body.temperature = 1
+          
+          // Log clearly that thinking IS enabled
+          if (missingCount > 0) {
+            console.log(
+              `[proxy] -----> THINKING: ENABLED (budget: ${budgetTokens}, ${missingCount} missing cache blocks but outside tool loop)`
+            )
+          } else {
+            console.log(
+              `[proxy] -----> THINKING: ENABLED (budget: ${budgetTokens})`
+            )
+          }
 
-        await logRequest('forced-thinking-applied', {
-          model: body.model,
-          incomingMaxTokens: incomingMax,
-          budgetTokens: newThinking.budget_tokens,
-          outgoingMaxTokens: body.max_tokens ?? effectiveMaxTokens ?? null,
-          cappedAtModelMax:
-            typeof (body.max_tokens ?? effectiveMaxTokens) === 'number'
-              ? ((body.max_tokens ?? effectiveMaxTokens) as number) >= modelCap
-              : false,
-          usedFallbackMax,
-          injectedThinkingBlocks: injectedCount,
-        })
+          await logRequest('forced-thinking-applied', {
+            model: body.model,
+            incomingMaxTokens: incomingMax,
+            budgetTokens: budgetTokens,
+            outgoingMaxTokens: body.max_tokens ?? effectiveMaxTokens,
+            cappedAtModelMax: effectiveMaxTokens >= modelCap,
+            usedFallbackMax,
+            injectedThinkingBlocks: injectedCount,
+            missingThinkingBlocks: missingCount,
+            enabledDespiteMissingCache: missingCount > 0,
+          })
+        }
       } else {
-        await logRequest('skipped-forced-thinking', {
+        // Inside tool loop with missing cached thinking blocks
+        // Temporarily disable thinking to complete the tool loop - it will heal on next user text message
+        console.log(
+          `[proxy] -----> THINKING: DISABLED (inside tool loop, ${missingCount} missing cache blocks)`
+        )
+        await logRequest('thinking-temporarily-disabled', {
           model: body.model,
-          reason: 'missing-cached-thinking-blocks',
+          reason: 'inside-tool-loop-missing-cache',
           missingCount,
           injectedCount,
+          isInsideToolLoop: true,
         })
       }
     }
@@ -767,7 +857,7 @@ const messagesFn = async (c: Context) => {
 
           // Cache thinking blocks from accumulated content with full conversation context
           if (accumulatedContent.length > 0) {
-            cacheThinkingBlock(accumulatedContent, originalMessages)
+            await cacheThinkingBlock(accumulatedContent, originalMessages)
           }
         } catch (error) {
           console.error('Stream error:', error)
@@ -780,7 +870,7 @@ const messagesFn = async (c: Context) => {
 
       // Cache thinking blocks from the response for future multi-turn conversations
       if (responseData.content && Array.isArray(responseData.content)) {
-        cacheThinkingBlock(responseData.content, originalMessages)
+        await cacheThinkingBlock(responseData.content, originalMessages)
       }
 
       if (transformToOpenAIFormat) {

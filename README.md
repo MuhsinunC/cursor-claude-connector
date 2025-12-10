@@ -161,18 +161,40 @@ You can optionally set an `API_KEY` environment variable for additional security
 
 When `FORCE_THINKING_BUDGET` is set, the proxy enables Claude's extended thinking feature. However, Cursor strips thinking blocks from conversation history, which would normally cause Claude's API to reject follow-up requests.
 
-**How we handle this:** The proxy caches thinking blocks (with their cryptographic signatures) when Claude responds, then injects them back into assistant messages on follow-up requests. The cache key is based on the full conversation context (all messages up to that point).
+**How we handle this:** The proxy caches thinking blocks (with their cryptographic signatures) in Redis when Claude responds, then injects them back into assistant messages on follow-up requests. The cache key is based on the full conversation context (all messages up to that point). Cache entries persist until Redis evicts them (when the database fills up).
 
 **Theoretical edge case:** If two different conversations have identical message histories AND produce identical assistant responses, they would share a cache entry. This means one conversation's thinking block could be injected into another conversation. In practice, this is extremely unlikely because:
 - Conversations would need identical user prompts in the same order
 - Claude would need to produce word-for-word identical responses
-- Both would need to happen while the cache entry exists (in-memory, lost on server restart)
+- Both would need to happen while the cache entry exists
 
 **If this did happen:** Claude validates that the thinking block signature is authentic (came from Claude), not that it semantically matches the conversation. So the request would still succeed, but Claude might see a thinking trace from a different context. This has no practical impact on response quality.
 
-### Server Restarts
+### Cache Misses
 
-The thinking block cache is in-memory. If you restart the proxy mid-conversation, cached thinking blocks are lost. On the next request, thinking will be skipped for that turn (the request still works, just without extended thinking for follow-up messages until a new conversation starts).
+If cached thinking blocks are not found for historical messages (e.g., Redis evicted them, or the conversation started before caching was enabled), the behavior depends on the conversation state:
+
+**Outside a tool loop** (last user message is text):
+- **Thinking is ENABLED** - Claude's API automatically strips old thinking blocks when a new user text message starts a new turn
+- You'll see: `NOTICE: Enabling thinking despite X missing cached block(s) - last user message is text`
+- The conversation "heals" itself as new thinking blocks get cached
+
+**Inside a tool loop** (last user message is tool_result):
+- **Thinking is temporarily DISABLED** for this request only
+- You'll see: `WARNING: Temporarily disabling thinking - inside tool loop with X missing cached block(s)`
+- Once Claude responds and you send a new text message, thinking will be re-enabled
+- The conversation "heals" on the next turn
+
+This smart behavior ensures you get thinking in most cases, only temporarily losing it when stuck mid-tool-call without cached blocks.
+
+### Redis Unavailability
+
+If Redis becomes unavailable (network issue, Upstash outage, etc.), the proxy handles it gracefully:
+- **Caching fails:** Warning logged, request continues normally (block just won't be cached)
+- **Cache lookup fails:** Warning logged, treated as cache miss, thinking skipped for that turn
+- **The proxy does NOT break** - requests continue to work, you just lose extended thinking until Redis is back
+
+Make sure to enable **Eviction** in your Upstash database settings so Redis automatically removes old entries when the database fills up.
 
 ## 🤝 Contributions
 
