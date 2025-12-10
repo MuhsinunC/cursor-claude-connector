@@ -52,6 +52,8 @@ const thinkingCapableModels = new Set<string>([
 const supportsExtendedThinking = (model: string) =>
   thinkingCapableModels.has(model)
 
+const enableRequestLogging = process.env.LOG_REQUEST_DEBUG === 'true'
+
 // Handle CORS preflight requests for all routes
 app.options('*', corsPreflightHandler)
 
@@ -255,6 +257,32 @@ const messagesFn = async (c: Context) => {
   const body: AnthropicRequestBody = await c.req.json()
   const isStreaming = body.stream === true
 
+  if (enableRequestLogging) {
+    console.log(
+      '[proxy] incoming request summary',
+      JSON.stringify(
+        {
+          path: c.req.path,
+          model: body.model,
+          hasThinking: !!(body as any).thinking,
+          thinkingType: (body as any).thinking?.type,
+          thinkingBudget: (body as any).thinking?.budget_tokens,
+          hasTools: Array.isArray((body as any).tools),
+          toolsCount: Array.isArray((body as any).tools)
+            ? (body as any).tools.length
+            : 0,
+          hasFunctions: Array.isArray((body as any).functions),
+          messagesPreview: Array.isArray(body.messages)
+            ? body.messages.slice(0, 2)
+            : undefined,
+          stream: isStreaming,
+        },
+        null,
+        2,
+      ),
+    )
+  }
+
   const apiKey = c.req.header('authorization')?.split(' ')?.[1]
   if (apiKey && apiKey !== process.env.API_KEY) {
     return c.json(
@@ -362,6 +390,34 @@ const messagesFn = async (c: Context) => {
       ) {
         body.max_tokens = fallbackMax
       }
+    }
+
+    if (enableRequestLogging) {
+      console.log(
+        '[proxy] outgoing request summary',
+        JSON.stringify(
+          {
+            model: body.model,
+            hasThinking: !!(body as any).thinking,
+            thinkingType: (body as any).thinking?.type,
+            thinkingBudget: (body as any).thinking?.budget_tokens,
+            hasTools: Array.isArray((body as any).tools),
+            toolsCount: Array.isArray((body as any).tools)
+              ? (body as any).tools.length
+              : 0,
+            messagesCount: Array.isArray(body.messages)
+              ? body.messages.length
+              : 0,
+            stream: isStreaming,
+            forcedThinking:
+              Number.isFinite(forceThinkingBudget) &&
+              forceThinkingBudget > 0 &&
+              supportsExtendedThinking(body.model),
+          },
+          null,
+          2,
+        ),
+      )
     }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
