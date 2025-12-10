@@ -60,13 +60,6 @@ const logFile =
   process.env.LOG_REQUEST_FILE || join(process.cwd(), 'logs', 'requests.log')
 
 let logDirReady = false
-const safeStringify = (data: unknown) => {
-  try {
-    return JSON.stringify(data, null, 2)
-  } catch (err) {
-    return `{"stringify_error":"${(err as Error).message}"}`
-  }
-}
 
 const logRequest = async (label: string, payload: unknown) => {
   if (!enableRequestLogging) return
@@ -80,7 +73,7 @@ const logRequest = async (label: string, payload: unknown) => {
       label,
       payload,
     }
-    await appendFile(logFile, `${safeStringify(entry)}\n`)
+    await appendFile(logFile, `${JSON.stringify(entry)}\n`)
   } catch (err) {
     // Swallow logging errors to avoid impacting proxy
   }
