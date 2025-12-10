@@ -75,8 +75,12 @@ const logRequest = async (label: string, payload: unknown) => {
       await mkdir(dirname(logFile), { recursive: true })
       logDirReady = true
     }
-    const line = `${new Date().toISOString()} ${label}: ${safeStringify(payload)}\n`
-    await appendFile(logFile, line)
+    const entry = {
+      ts: new Date().toISOString(),
+      label,
+      payload,
+    }
+    await appendFile(logFile, `${safeStringify(entry)}\n`)
   } catch (err) {
     // Swallow logging errors to avoid impacting proxy
   }
@@ -304,6 +308,9 @@ const messagesFn = async (c: Context) => {
   const body: AnthropicRequestBody = await c.req.json()
   const incomingBodySnapshot = JSON.parse(JSON.stringify(body))
   const isStreaming = body.stream === true
+
+  // Lightweight console notice for visibility
+  console.log(`[proxy] request received ${new Date().toISOString()}`)
 
   await logRequest('incoming-request', {
     path: c.req.path,
