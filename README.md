@@ -155,6 +155,25 @@ You can optionally set an `API_KEY` environment variable for additional security
 - Local connection between Cursor and the proxy
 - Open source code for auditing
 
+## Notes and Caveats
+
+### Extended Thinking and Multi-Turn Conversations
+
+When `FORCE_THINKING_BUDGET` is set, the proxy enables Claude's extended thinking feature. However, Cursor strips thinking blocks from conversation history, which would normally cause Claude's API to reject follow-up requests.
+
+**How we handle this:** The proxy caches thinking blocks (with their cryptographic signatures) when Claude responds, then injects them back into assistant messages on follow-up requests. The cache key is based on the full conversation context (all messages up to that point).
+
+**Theoretical edge case:** If two different conversations have identical message histories AND produce identical assistant responses, they would share a cache entry. This means one conversation's thinking block could be injected into another conversation. In practice, this is extremely unlikely because:
+- Conversations would need identical user prompts in the same order
+- Claude would need to produce word-for-word identical responses
+- Both would need to happen while the cache entry exists (in-memory, lost on server restart)
+
+**If this did happen:** Claude validates that the thinking block signature is authentic (came from Claude), not that it semantically matches the conversation. So the request would still succeed, but Claude might see a thinking trace from a different context. This has no practical impact on response quality.
+
+### Server Restarts
+
+The thinking block cache is in-memory. If you restart the proxy mid-conversation, cached thinking blocks are lost. On the next request, thinking will be skipped for that turn (the request still works, just without extended thinking for follow-up messages until a new conversation starts).
+
 ## 🤝 Contributions
 
 Contributions are welcome! If you find any issues or have suggestions, please open an issue or PR.
