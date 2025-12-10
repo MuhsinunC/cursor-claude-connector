@@ -513,6 +513,13 @@ const messagesFn = async (c: Context) => {
 
     if (!response.ok) {
       const error = await response.text()
+      await logRequest('response-error', {
+        model: body.model,
+        status: response.status,
+        statusText: response.statusText,
+        requestId: response.headers.get('request-id'),
+        bodySnippet: error.length > 2000 ? `${error.slice(0, 2000)}...` : error,
+      })
       console.error('API Error:', error)
 
       if (response.status === 401) {
@@ -609,6 +616,11 @@ const messagesFn = async (c: Context) => {
       return c.json(responseData)
     }
   } catch (error) {
+    await logRequest('response-exception', {
+      model: body.model,
+      error: (error as Error).message,
+      stack: (error as Error).stack,
+    })
     console.error('Proxy error:', error)
     return c.json<ErrorResponse>(
       { error: 'Proxy error', details: (error as Error).message },
