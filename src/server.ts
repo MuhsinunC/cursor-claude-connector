@@ -34,39 +34,69 @@ import type {
 
 const app = new Hono()
 
-// Cache for thinking blocks - maps content hash to thinking block
+// Cache for thinking blocks - maps context hash to thinking block
 // This allows us to restore thinking blocks that Cursor strips from conversation history
+// The hash includes all messages UP TO AND INCLUDING the assistant message, ensuring
+// we only inject thinking blocks from the exact same conversation context
 interface ThinkingBlockCache {
   thinking: string
   signature: string
 }
 const thinkingBlockCache = new Map<string, ThinkingBlockCache>()
 
-// Hash assistant message text content for cache lookup
-function hashAssistantContent(content: any): string {
-  let textContent = ''
+// Extract text content from a message for hashing (ignoring thinking blocks)
+function extractMessageText(content: any): string {
   if (typeof content === 'string') {
-    textContent = content
-  } else if (Array.isArray(content)) {
-    // Extract text from content blocks, ignoring thinking blocks
-    textContent = content
-      .filter((b: any) => b.type === 'text' || b.type === 'tool_use')
+    return content
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => b.type === 'text' || b.type === 'tool_use' || b.type === 'tool_result')
       .map((b: any) => {
         if (b.type === 'text') return b.text || ''
         if (b.type === 'tool_use') return `tool:${b.name}:${JSON.stringify(b.input)}`
+        if (b.type === 'tool_result') return `result:${b.tool_use_id}:${b.content}`
         return ''
       })
       .join('|')
   }
-  return createHash('sha256').update(textContent).digest('hex').slice(0, 32)
+  return ''
 }
 
-// Extract and cache thinking block from a response content array
-function cacheThinkingBlock(content: any[]): void {
+// Hash the conversation context up to and including a specific assistant message index
+// This ensures thinking blocks are only matched to the exact conversation that produced them
+function hashConversationContext(messages: any[], assistantIndex: number): string {
+  const contextParts: string[] = []
+  for (let i = 0; i <= assistantIndex && i < messages.length; i++) {
+    const msg = messages[i]
+    const role = msg.role || 'unknown'
+    const text = extractMessageText(msg.content)
+    contextParts.push(`${role}:${text}`)
+  }
+  return createHash('sha256').update(contextParts.join('\n---\n')).digest('hex').slice(0, 32)
+}
+
+// Cache thinking block with full conversation context
+// Called after receiving a response - we hash all messages that were sent plus the new response
+let lastRequestMessages: any[] = []
+
+function cacheThinkingBlock(content: any[], requestMessages: any[]): void {
   const thinkingBlock = content.find((b: any) => b.type === 'thinking' && b.signature)
   if (!thinkingBlock) return
 
-  const hash = hashAssistantContent(content)
+  // Create a virtual "assistant message" from the response content
+  const assistantContent = extractMessageText(content)
+  
+  // Hash the full context: all request messages + this response
+  const contextParts = requestMessages.map((msg: any) => {
+    const role = msg.role || 'unknown'
+    const text = extractMessageText(msg.content)
+    return `${role}:${text}`
+  })
+  contextParts.push(`assistant:${assistantContent}`)
+  
+  const hash = createHash('sha256').update(contextParts.join('\n---\n')).digest('hex').slice(0, 32)
+  
   thinkingBlockCache.set(hash, {
     thinking: thinkingBlock.thinking || '',
     signature: thinkingBlock.signature,
@@ -347,6 +377,11 @@ const messagesFn = async (c: Context) => {
   const body: AnthropicRequestBody = await c.req.json()
   const incomingBodySnapshot = JSON.parse(JSON.stringify(body))
   const isStreaming = body.stream === true
+  
+  // Store original messages for thinking block caching (before we modify them)
+  const originalMessages = Array.isArray(body.messages) 
+    ? JSON.parse(JSON.stringify(body.messages)) 
+    : []
 
   // Lightweight console notice for visibility
   console.log(`[proxy] request received ${new Date().toISOString()}`)
@@ -471,10 +506,12 @@ const messagesFn = async (c: Context) => {
 
     if (shouldForceThinking && Array.isArray(body.messages)) {
       // Try to inject cached thinking blocks into assistant messages
+      // We use full conversation context for cache lookup to ensure accuracy
       let injectedCount = 0
       let missingCount = 0
 
-      for (const msg of body.messages) {
+      for (let i = 0; i < body.messages.length; i++) {
+        const msg = body.messages[i]
         if (msg.role !== 'assistant') continue
 
         // Convert string content to array form
@@ -492,8 +529,8 @@ const messagesFn = async (c: Context) => {
           continue // Already has thinking
         }
 
-        // Try to find cached thinking block
-        const hash = hashAssistantContent(msg.content)
+        // Try to find cached thinking block using full conversation context
+        const hash = hashConversationContext(body.messages, i)
         const cached = thinkingBlockCache.get(hash)
 
         if (cached) {
@@ -728,9 +765,9 @@ const messagesFn = async (c: Context) => {
             }
           }
 
-          // Cache thinking blocks from accumulated content
+          // Cache thinking blocks from accumulated content with full conversation context
           if (accumulatedContent.length > 0) {
-            cacheThinkingBlock(accumulatedContent)
+            cacheThinkingBlock(accumulatedContent, originalMessages)
           }
         } catch (error) {
           console.error('Stream error:', error)
@@ -743,7 +780,7 @@ const messagesFn = async (c: Context) => {
 
       // Cache thinking blocks from the response for future multi-turn conversations
       if (responseData.content && Array.isArray(responseData.content)) {
-        cacheThinkingBlock(responseData.content)
+        cacheThinkingBlock(responseData.content, originalMessages)
       }
 
       if (transformToOpenAIFormat) {
