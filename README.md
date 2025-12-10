@@ -97,9 +97,21 @@ Fill at least:
 - `NGROK_DOMAIN` (your reserved ngrok domain, e.g. sensitive-cheryle-unwillfully.ngrok-free.dev)
 
 Optional toggles:
-- `FORCE_THINKING_BUDGET` (forces thinking if missing; budget is auto-shrunk to fit 64k cap)
-- `FORCE_MAX_TOKENS` (forces outgoing max_tokens to this number, capped at 64k)
-- `LOG_REQUEST_DEBUG` (writes incoming/outgoing bodies to `logs/requests.log`)
+- `FORCE_THINKING_BUDGET` (If thinking is not set in the source request, forces thinking to this token budget. Budget is auto-shrunk to fit 64k cap.)
+- `FORCE_MAX_TOKENS` (forces outgoing max_tokens to this number, regardless of the source request's max_tokens value. Capped at 64k.)
+- `LOG_REQUEST_DEBUG` (writes source and forwarded request bodies to `logs/requests.log`)
+
+2a) **Install ngrok (for local tunneling)**
+```bash
+brew install ngrok
+```
+- Create a free ngrok account
+- Add your authtoken using:
+```bash
+ngrok config add-authtoken <TOKEN>
+```
+- Claim a static domain (e.g. `yourname.ngrok-free.dev`) from the Web UI (Universal Gateway -> Domains)
+- Put your static domain in `NGROK_DOMAIN` in `.env`
 
 3) **Run the start script** (starts proxy + ngrok, cleans up on exit)
 ```bash
