@@ -464,6 +464,40 @@ const messagesFn = async (c: Context) => {
       })
     }
 
+    // When thinking is enabled, inject placeholder thinking blocks into assistant messages
+    // that don't already have them (Claude API requires this for multi-turn conversations)
+    if (body.thinking && Array.isArray(body.messages)) {
+      let injectedCount = 0
+      for (const msg of body.messages) {
+        if (msg.role !== 'assistant') continue
+        // Convert string content to array form
+        if (typeof msg.content === 'string') {
+          msg.content = [{ type: 'text', text: msg.content }]
+        }
+        if (!Array.isArray(msg.content)) continue
+        // Check if first block is already thinking/redacted_thinking
+        const firstBlock = msg.content[0]
+        if (
+          firstBlock &&
+          (firstBlock.type === 'thinking' || firstBlock.type === 'redacted_thinking')
+        ) {
+          continue
+        }
+        // Prepend a minimal thinking block
+        msg.content.unshift({
+          type: 'thinking',
+          thinking: '...',
+        })
+        injectedCount++
+      }
+      if (injectedCount > 0) {
+        await logRequest('injected-thinking-blocks', {
+          model: body.model,
+          injectedCount,
+        })
+      }
+    }
+
     await logRequest('outgoing-request', {
       model: body.model,
       hasThinking: !!(body as any).thinking,
