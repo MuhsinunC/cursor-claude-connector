@@ -3,6 +3,7 @@ import { serve } from '@hono/node-server'
 import { stream } from 'hono/streaming'
 import { readFile, appendFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
+import { createHash } from 'node:crypto'
 import { getAccessToken } from './auth/oauth-manager'
 import {
   login as oauthLogin,
@@ -32,6 +33,51 @@ import type {
 // Static files are served by Vercel, not needed here
 
 const app = new Hono()
+
+// Cache for thinking blocks - maps content hash to thinking block
+// This allows us to restore thinking blocks that Cursor strips from conversation history
+interface ThinkingBlockCache {
+  thinking: string
+  signature: string
+}
+const thinkingBlockCache = new Map<string, ThinkingBlockCache>()
+
+// Hash assistant message text content for cache lookup
+function hashAssistantContent(content: any): string {
+  let textContent = ''
+  if (typeof content === 'string') {
+    textContent = content
+  } else if (Array.isArray(content)) {
+    // Extract text from content blocks, ignoring thinking blocks
+    textContent = content
+      .filter((b: any) => b.type === 'text' || b.type === 'tool_use')
+      .map((b: any) => {
+        if (b.type === 'text') return b.text || ''
+        if (b.type === 'tool_use') return `tool:${b.name}:${JSON.stringify(b.input)}`
+        return ''
+      })
+      .join('|')
+  }
+  return createHash('sha256').update(textContent).digest('hex').slice(0, 32)
+}
+
+// Extract and cache thinking block from a response content array
+function cacheThinkingBlock(content: any[]): void {
+  const thinkingBlock = content.find((b: any) => b.type === 'thinking' && b.signature)
+  if (!thinkingBlock) return
+
+  const hash = hashAssistantContent(content)
+  thinkingBlockCache.set(hash, {
+    thinking: thinkingBlock.thinking || '',
+    signature: thinkingBlock.signature,
+  })
+
+  // Limit cache size (LRU-ish: just cap at 1000 entries)
+  if (thinkingBlockCache.size > 1000) {
+    const firstKey = thinkingBlockCache.keys().next().value
+    if (firstKey) thinkingBlockCache.delete(firstKey)
+  }
+}
 
 // Models that support extended thinking (per Anthropic docs)
 const thinkingCapableModels = new Set<string>([
@@ -415,84 +461,111 @@ const messagesFn = async (c: Context) => {
     }
 
     // Optionally force extended thinking for supported models when env is set
+    // For multi-turn conversations, we inject cached thinking blocks into assistant messages
     const forceThinkingBudget = Number(process.env.FORCE_THINKING_BUDGET || '')
-    if (
+    const shouldForceThinking =
       Number.isFinite(forceThinkingBudget) &&
       forceThinkingBudget > 0 &&
       !body.thinking &&
       supportsExtendedThinking(body.model)
-    ) {
-      const newThinking: any = {
-        type: 'enabled',
-        budget_tokens: forceThinkingBudget,
-      }
-      body.thinking = newThinking
 
-      const incomingMax =
-        typeof body.max_tokens === 'number' ? body.max_tokens : null
-      const modelCap = getModelMaxTokens(body.model)
-
-    let usedFallbackMax = false
-    let effectiveMaxTokens = incomingMax
-
-    if (incomingMax !== null) {
-      // Respect caller max_tokens; adjust thinking budget to fit within cap
-      const maxThinkingPossible = Math.max(0, modelCap - incomingMax)
-      if (newThinking.budget_tokens > maxThinkingPossible) {
-        newThinking.budget_tokens = maxThinkingPossible
-      }
-    } else {
-      // No caller max_tokens: choose a fallback and cap to model limit
-      const fallback = Math.max(forceThinkingBudget + 6000, forceThinkingBudget * 2)
-      usedFallbackMax = true
-      const cappedFallback = Math.min(fallback, modelCap)
-      effectiveMaxTokens = cappedFallback
-      newThinking.budget_tokens = Math.min(newThinking.budget_tokens, cappedFallback)
-      body.max_tokens = cappedFallback
-    }
-
-      await logRequest('forced-thinking-applied', {
-        model: body.model,
-        incomingMaxTokens: incomingMax,
-        budgetTokens: newThinking.budget_tokens,
-      outgoingMaxTokens: body.max_tokens ?? effectiveMaxTokens ?? null,
-      cappedAtModelMax:
-        typeof (body.max_tokens ?? effectiveMaxTokens) === 'number'
-          ? ((body.max_tokens ?? effectiveMaxTokens) as number) >= modelCap
-          : false,
-        usedFallbackMax,
-      })
-    }
-
-    // When thinking is enabled, inject placeholder thinking blocks into assistant messages
-    // that don't already have them (Claude API requires this for multi-turn conversations)
-    if (body.thinking && Array.isArray(body.messages)) {
+    if (shouldForceThinking && Array.isArray(body.messages)) {
+      // Try to inject cached thinking blocks into assistant messages
       let injectedCount = 0
+      let missingCount = 0
+
       for (const msg of body.messages) {
         if (msg.role !== 'assistant') continue
+
         // Convert string content to array form
         if (typeof msg.content === 'string') {
           msg.content = [{ type: 'text', text: msg.content }]
         }
         if (!Array.isArray(msg.content)) continue
+
         // Check if first block is already thinking/redacted_thinking
         const firstBlock = msg.content[0]
         if (
           firstBlock &&
           (firstBlock.type === 'thinking' || firstBlock.type === 'redacted_thinking')
         ) {
-          continue
+          continue // Already has thinking
         }
-        // Prepend a minimal thinking block
-        msg.content.unshift({
-          type: 'thinking',
-          thinking: '...',
-        })
-        injectedCount++
+
+        // Try to find cached thinking block
+        const hash = hashAssistantContent(msg.content)
+        const cached = thinkingBlockCache.get(hash)
+
+        if (cached) {
+          // Inject the cached thinking block at the start
+          msg.content.unshift({
+            type: 'thinking',
+            thinking: cached.thinking,
+            signature: cached.signature,
+          })
+          injectedCount++
+        } else {
+          missingCount++
+        }
       }
-      if (injectedCount > 0) {
-        await logRequest('injected-thinking-blocks', {
+
+      if (injectedCount > 0 || missingCount > 0) {
+        await logRequest('thinking-block-injection', {
           model: body.model,
+          injectedCount,
+          missingCount,
+          cacheSize: thinkingBlockCache.size,
+        })
+      }
+
+      // Only enable thinking if we successfully injected all needed blocks (or there were none needed)
+      if (missingCount === 0) {
+        const newThinking: any = {
+          type: 'enabled',
+          budget_tokens: forceThinkingBudget,
+        }
+        body.thinking = newThinking
+
+        const incomingMax =
+          typeof body.max_tokens === 'number' ? body.max_tokens : null
+        const modelCap = getModelMaxTokens(body.model)
+
+        let usedFallbackMax = false
+        let effectiveMaxTokens = incomingMax
+
+        if (incomingMax !== null) {
+          // Respect caller max_tokens; adjust thinking budget to fit within cap
+          const maxThinkingPossible = Math.max(0, modelCap - incomingMax)
+          if (newThinking.budget_tokens > maxThinkingPossible) {
+            newThinking.budget_tokens = maxThinkingPossible
+          }
+        } else {
+          // No caller max_tokens: choose a fallback and cap to model limit
+          const fallback = Math.max(forceThinkingBudget + 6000, forceThinkingBudget * 2)
+          usedFallbackMax = true
+          const cappedFallback = Math.min(fallback, modelCap)
+          effectiveMaxTokens = cappedFallback
+          newThinking.budget_tokens = Math.min(newThinking.budget_tokens, cappedFallback)
+          body.max_tokens = cappedFallback
+        }
+
+        await logRequest('forced-thinking-applied', {
+          model: body.model,
+          incomingMaxTokens: incomingMax,
+          budgetTokens: newThinking.budget_tokens,
+          outgoingMaxTokens: body.max_tokens ?? effectiveMaxTokens ?? null,
+          cappedAtModelMax:
+            typeof (body.max_tokens ?? effectiveMaxTokens) === 'number'
+              ? ((body.max_tokens ?? effectiveMaxTokens) as number) >= modelCap
+              : false,
+          usedFallbackMax,
+          injectedThinkingBlocks: injectedCount,
+        })
+      } else {
+        await logRequest('skipped-forced-thinking', {
+          model: body.model,
+          reason: 'missing-cached-thinking-blocks',
+          missingCount,
           injectedCount,
         })
       }
@@ -591,12 +664,46 @@ const messagesFn = async (c: Context) => {
         const converterState = createConverterState()
         const enableLogging = false
 
+        // Accumulate content blocks for caching thinking blocks
+        const accumulatedContent: any[] = []
+        let currentBlockIndex = -1
+        let currentBlock: any = null
+
         try {
           while (true) {
             const { done, value } = await reader.read()
             if (done) break
 
             const chunk = decoder.decode(value, { stream: true })
+
+            // Parse SSE events to accumulate thinking blocks for caching
+            const lines = chunk.split('\n')
+            for (const line of lines) {
+              if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                try {
+                  const eventData = JSON.parse(line.slice(6))
+                  // Track content blocks for caching
+                  if (eventData.type === 'content_block_start') {
+                    currentBlockIndex = eventData.index
+                    currentBlock = { ...eventData.content_block }
+                  } else if (eventData.type === 'content_block_delta' && currentBlock) {
+                    const delta = eventData.delta
+                    if (delta.type === 'thinking_delta' && delta.thinking) {
+                      currentBlock.thinking = (currentBlock.thinking || '') + delta.thinking
+                    } else if (delta.type === 'signature_delta' && delta.signature) {
+                      currentBlock.signature = (currentBlock.signature || '') + delta.signature
+                    } else if (delta.type === 'text_delta' && delta.text) {
+                      currentBlock.text = (currentBlock.text || '') + delta.text
+                    }
+                  } else if (eventData.type === 'content_block_stop' && currentBlock) {
+                    accumulatedContent.push(currentBlock)
+                    currentBlock = null
+                  }
+                } catch {
+                  // Ignore parse errors for non-JSON lines
+                }
+              }
+            }
 
             if (transformToOpenAIFormat) {
               if (enableLogging) {
@@ -620,6 +727,11 @@ const messagesFn = async (c: Context) => {
               await stream.write(chunk)
             }
           }
+
+          // Cache thinking blocks from accumulated content
+          if (accumulatedContent.length > 0) {
+            cacheThinkingBlock(accumulatedContent)
+          }
         } catch (error) {
           console.error('Stream error:', error)
         } finally {
@@ -628,6 +740,11 @@ const messagesFn = async (c: Context) => {
       })
     } else {
       const responseData = (await response.json()) as AnthropicResponse
+
+      // Cache thinking blocks from the response for future multi-turn conversations
+      if (responseData.content && Array.isArray(responseData.content)) {
+        cacheThinkingBlock(responseData.content)
+      }
 
       if (transformToOpenAIFormat) {
         const openAIResponse = convertNonStreamingResponse(responseData)
