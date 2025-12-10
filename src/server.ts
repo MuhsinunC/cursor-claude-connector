@@ -54,6 +54,8 @@ const supportsExtendedThinking = (model: string) =>
 
 const enableRequestLogging = process.env.LOG_REQUEST_DEBUG === 'true'
 const forcedMaxTokensValue = Number(process.env.FORCE_MAX_TOKENS || '')
+const enableInterleavedThinking =
+  process.env.ENABLE_INTERLEAVED_THINKING === 'true'
 const logFile =
   process.env.LOG_REQUEST_FILE || join(process.cwd(), 'logs', 'requests.log')
 
@@ -384,11 +386,18 @@ const messagesFn = async (c: Context) => {
       )
     }
 
+    const betaHeaders = [
+      'oauth-2025-04-20',
+      'fine-grained-tool-streaming-2025-05-14',
+    ]
+    if (enableInterleavedThinking) {
+      betaHeaders.push('interleaved-thinking-2025-05-14')
+    }
+
     headers = {
       'content-type': 'application/json',
       authorization: `Bearer ${oauthToken}`,
-      'anthropic-beta':
-        'oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14',
+      'anthropic-beta': betaHeaders.join(','),
       'anthropic-version': '2023-06-01',
       'user-agent': '@anthropic-ai/sdk 1.2.12 node/22.13.1',
       accept: isStreaming ? 'text/event-stream' : 'application/json',
