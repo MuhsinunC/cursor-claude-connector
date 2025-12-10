@@ -33,6 +33,25 @@ import type {
 
 const app = new Hono()
 
+// Models that support extended thinking (per Anthropic docs)
+const thinkingCapableModels = new Set<string>([
+  'claude-opus-4-5',
+  'claude-opus-4-5-20251101',
+  'claude-opus-4-1',
+  'claude-opus-4-1-20250805',
+  'claude-opus-4-0',
+  'claude-opus-4-20250514',
+  'claude-sonnet-4-5',
+  'claude-sonnet-4-5-20250929',
+  'claude-sonnet-4-20250514',
+  'claude-haiku-4-5',
+  'claude-haiku-4-5-20251001',
+  'claude-3-7-sonnet-20250219',
+])
+
+const supportsExtendedThinking = (model: string) =>
+  thinkingCapableModels.has(model)
+
 // Handle CORS preflight requests for all routes
 app.options('*', corsPreflightHandler)
 
@@ -317,6 +336,31 @@ const messagesFn = async (c: Context) => {
 
       if (!body.system) {
         body.system = []
+      }
+    }
+
+    // Optionally force extended thinking for supported models when env is set
+    const forceThinkingBudget = Number(process.env.FORCE_THINKING_BUDGET || '')
+    if (
+      Number.isFinite(forceThinkingBudget) &&
+      forceThinkingBudget > 0 &&
+      !body.thinking &&
+      supportsExtendedThinking(body.model)
+    ) {
+      body.thinking = {
+        type: 'enabled',
+        budget_tokens: forceThinkingBudget,
+      }
+
+      // Ensure max_tokens is set high enough for thinking budget
+      const fallbackMax =
+        Number(process.env.FORCE_THINKING_MAX_TOKENS || '') ||
+        Math.max(forceThinkingBudget + 6000, forceThinkingBudget * 2)
+      if (
+        !body.max_tokens ||
+        (typeof body.max_tokens === 'number' && body.max_tokens < fallbackMax)
+      ) {
+        body.max_tokens = fallbackMax
       }
     }
 
