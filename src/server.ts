@@ -1,8 +1,8 @@
 import { Hono, Context } from 'hono'
 import { serve } from '@hono/node-server'
 import { stream } from 'hono/streaming'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFile, appendFile, mkdir } from 'node:fs/promises'
+import { join, dirname } from 'node:path'
 import { getAccessToken } from './auth/oauth-manager'
 import {
   login as oauthLogin,
@@ -53,6 +53,51 @@ const supportsExtendedThinking = (model: string) =>
   thinkingCapableModels.has(model)
 
 const enableRequestLogging = process.env.LOG_REQUEST_DEBUG === 'true'
+const forcedMaxTokensValue = Number(process.env.FORCE_MAX_TOKENS || '')
+const logFile =
+  process.env.LOG_REQUEST_FILE || join(process.cwd(), 'logs', 'requests.log')
+
+let logDirReady = false
+const safeStringify = (data: unknown) => {
+  try {
+    return JSON.stringify(data, null, 2)
+  } catch (err) {
+    return `{"stringify_error":"${(err as Error).message}"}`
+  }
+}
+
+const logRequest = async (label: string, payload: unknown) => {
+  if (!enableRequestLogging) return
+  try {
+    if (!logDirReady) {
+      await mkdir(dirname(logFile), { recursive: true })
+      logDirReady = true
+    }
+    const line = `${new Date().toISOString()} ${label}: ${safeStringify(payload)}\n`
+    await appendFile(logFile, line)
+  } catch (err) {
+    // Swallow logging errors to avoid impacting proxy
+  }
+}
+
+// Conservative model max-token map (total output cap including thinking)
+const modelMaxTokens: Record<string, number> = {
+  'claude-opus-4-5': 64_000,
+  'claude-opus-4-5-20251101': 64_000,
+  'claude-opus-4-1': 64_000,
+  'claude-opus-4-1-20250805': 64_000,
+  'claude-opus-4-0': 64_000,
+  'claude-opus-4-20250514': 64_000,
+  'claude-sonnet-4-5': 64_000,
+  'claude-sonnet-4-5-20250929': 64_000,
+  'claude-sonnet-4-20250514': 64_000,
+  'claude-haiku-4-5': 64_000,
+  'claude-haiku-4-5-20251001': 64_000,
+  'claude-3-7-sonnet-20250219': 64_000,
+  // fallback below
+}
+
+const getModelMaxTokens = (model: string) => modelMaxTokens[model] ?? 64_000
 
 // Handle CORS preflight requests for all routes
 app.options('*', corsPreflightHandler)
@@ -255,33 +300,26 @@ const messagesFn = async (c: Context) => {
   let headers: Record<string, string> = c.req.header() as Record<string, string>
   headers.host = 'api.anthropic.com'
   const body: AnthropicRequestBody = await c.req.json()
+  const incomingBodySnapshot = JSON.parse(JSON.stringify(body))
   const isStreaming = body.stream === true
 
-  if (enableRequestLogging) {
-    console.log(
-      '[proxy] incoming request summary',
-      JSON.stringify(
-        {
-          path: c.req.path,
-          model: body.model,
-          hasThinking: !!(body as any).thinking,
-          thinkingType: (body as any).thinking?.type,
-          thinkingBudget: (body as any).thinking?.budget_tokens,
-          hasTools: Array.isArray((body as any).tools),
-          toolsCount: Array.isArray((body as any).tools)
-            ? (body as any).tools.length
-            : 0,
-          hasFunctions: Array.isArray((body as any).functions),
-          messagesPreview: Array.isArray(body.messages)
-            ? body.messages.slice(0, 2)
-            : undefined,
-          stream: isStreaming,
-        },
-        null,
-        2,
-      ),
-    )
-  }
+  await logRequest('incoming-request', {
+    path: c.req.path,
+    model: body.model,
+    hasThinking: !!(body as any).thinking,
+    thinkingType: (body as any).thinking?.type,
+    thinkingBudget: (body as any).thinking?.budget_tokens,
+    hasTools: Array.isArray((body as any).tools),
+    toolsCount: Array.isArray((body as any).tools)
+      ? (body as any).tools.length
+      : 0,
+    hasFunctions: Array.isArray((body as any).functions),
+    messagesPreview: Array.isArray(body.messages)
+      ? body.messages.slice(0, 2)
+      : undefined,
+    stream: isStreaming,
+    body: incomingBodySnapshot,
+  })
 
   const apiKey = c.req.header('authorization')?.split(' ')?.[1]
   if (apiKey && apiKey !== process.env.API_KEY) {
@@ -375,50 +413,88 @@ const messagesFn = async (c: Context) => {
       !body.thinking &&
       supportsExtendedThinking(body.model)
     ) {
-      body.thinking = {
+      const newThinking: any = {
         type: 'enabled',
         budget_tokens: forceThinkingBudget,
       }
+      body.thinking = newThinking
 
-      // Ensure max_tokens is set high enough for thinking budget
-      const fallbackMax =
-        Number(process.env.FORCE_THINKING_MAX_TOKENS || '') ||
-        Math.max(forceThinkingBudget + 6000, forceThinkingBudget * 2)
-      if (
-        !body.max_tokens ||
-        (typeof body.max_tokens === 'number' && body.max_tokens < fallbackMax)
-      ) {
-        body.max_tokens = fallbackMax
+      const incomingMax =
+        typeof body.max_tokens === 'number' ? body.max_tokens : null
+      const modelCap = getModelMaxTokens(body.model)
+
+    let usedFallbackMax = false
+    let effectiveMaxTokens = incomingMax
+
+    if (incomingMax !== null) {
+      // Respect caller max_tokens; adjust thinking budget to fit within cap
+      const maxThinkingPossible = Math.max(0, modelCap - incomingMax)
+      if (newThinking.budget_tokens > maxThinkingPossible) {
+        newThinking.budget_tokens = maxThinkingPossible
       }
+    } else {
+      // No caller max_tokens: choose a fallback and cap to model limit
+      const fallback = Math.max(forceThinkingBudget + 6000, forceThinkingBudget * 2)
+      usedFallbackMax = true
+      const cappedFallback = Math.min(fallback, modelCap)
+      effectiveMaxTokens = cappedFallback
+      newThinking.budget_tokens = Math.min(newThinking.budget_tokens, cappedFallback)
+      body.max_tokens = cappedFallback
     }
 
-    if (enableRequestLogging) {
-      console.log(
-        '[proxy] outgoing request summary',
-        JSON.stringify(
-          {
-            model: body.model,
-            hasThinking: !!(body as any).thinking,
-            thinkingType: (body as any).thinking?.type,
-            thinkingBudget: (body as any).thinking?.budget_tokens,
-            hasTools: Array.isArray((body as any).tools),
-            toolsCount: Array.isArray((body as any).tools)
-              ? (body as any).tools.length
-              : 0,
-            messagesCount: Array.isArray(body.messages)
-              ? body.messages.length
-              : 0,
-            stream: isStreaming,
-            forcedThinking:
-              Number.isFinite(forceThinkingBudget) &&
-              forceThinkingBudget > 0 &&
-              supportsExtendedThinking(body.model),
-          },
-          null,
-          2,
-        ),
-      )
+      await logRequest('forced-thinking-applied', {
+        model: body.model,
+        incomingMaxTokens: incomingMax,
+        budgetTokens: newThinking.budget_tokens,
+      outgoingMaxTokens: body.max_tokens ?? effectiveMaxTokens ?? null,
+      cappedAtModelMax:
+        typeof (body.max_tokens ?? effectiveMaxTokens) === 'number'
+          ? ((body.max_tokens ?? effectiveMaxTokens) as number) >= modelCap
+          : false,
+        usedFallbackMax,
+      })
     }
+
+    await logRequest('outgoing-request', {
+      model: body.model,
+      hasThinking: !!(body as any).thinking,
+      thinkingType: (body as any).thinking?.type,
+      thinkingBudget: (body as any).thinking?.budget_tokens,
+      hasTools: Array.isArray((body as any).tools),
+      toolsCount: Array.isArray((body as any).tools)
+        ? (body as any).tools.length
+        : 0,
+      messagesCount: Array.isArray(body.messages) ? body.messages.length : 0,
+      stream: isStreaming,
+      body: JSON.parse(JSON.stringify(body)),
+    })
+
+  // Optionally force max_tokens to a fixed value
+  if (Number.isFinite(forcedMaxTokensValue) && forcedMaxTokensValue > 0) {
+    const cap = getModelMaxTokens(body.model)
+    const forcedValue = Math.min(forcedMaxTokensValue, cap)
+    const originalMax =
+      typeof body.max_tokens === 'number' ? body.max_tokens : null
+    if (originalMax === null || originalMax !== forcedValue) {
+      await logRequest('forced-max-tokens', {
+        model: body.model,
+        originalMaxTokens: originalMax,
+        forcedMaxTokens: forcedValue,
+      })
+      body.max_tokens = forcedValue
+    }
+  }
+
+  // Final safety cap to model limit
+  const finalCap = getModelMaxTokens(body.model)
+  if (typeof body.max_tokens === 'number' && body.max_tokens > finalCap) {
+    await logRequest('max-tokens-capped', {
+      model: body.model,
+      originalMaxTokens: body.max_tokens,
+      cappedTo: finalCap,
+    })
+    body.max_tokens = finalCap
+  }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
